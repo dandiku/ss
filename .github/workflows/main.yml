@@ -11,38 +11,56 @@ jobs:
     steps:
       - name: Setup Fedora Container
         run: |
-          # Avvia un container Fedora con systemd
-          docker run -d --name fedora-rdp --privileged \
-            -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-            fedora:latest /usr/sbin/init
+          # Avvia container Fedora in background
+          docker run -d --name fedora-rdp \
+            -p 3389:3389 \
+            fedora:latest sleep infinity
           
           # Installa pacchetti necessari
           docker exec fedora-rdp bash -c "
-            dnf install -y xrdp tigervnc-server xorg-x11-server-Xorg \
-              xfce4-session xfce4-panel xfce4-terminal \
-              passwd sudo procps-ng iproute iptables wget
+            dnf install -y xrdp tigervnc-server \
+              xorg-x11-server-Xorg xorg-x11-xauth \
+              @xfce-desktop-environment \
+              passwd sudo procps-ng iproute iptables \
+              wget curl tar gzip
           "
 
       - name: Configure xrdp and Create User
         run: |
           docker exec fedora-rdp bash -c '
             # Genera password casuale sicura
-            PASSWORD=$(openssl rand -base64 16 | tr -dc "A-Za-z0-9!@#$%^&*" | head -c 16)
+            PASSWORD=$(tr -dc "A-Za-z0-9!@#$%^&*" < /dev/urandom | head -c 16)
             
             # Crea utente RDP
             useradd -m -G wheel rdpuser
             echo "rdpuser:$PASSWORD" | chpasswd
             
             # Configura XFCE come desktop environment
-            echo "startxfce4" > /home/rdpuser/.Xclients
-            chmod +x /home/rdpuser/.Xclients
+            echo "export XDG_SESSION_TYPE=x11" > /home/rdpuser/.xsession
+            echo "exec startxfce4" >> /home/rdpuser/.xsession
+            chmod +x /home/rdpuser/.xsession
             
             # Configura xrdp
-            systemctl enable xrdp
-            systemctl start xrdp
+            sed -i "s/port=3389/port=3389/g" /etc/xrdp/xrdp.ini
+            sed -i "s/security_layer=negotiate/security_layer=rdp/g" /etc/xrdp/xrdp.ini
+            sed -i "s/crypt_level=high/crypt_level=low/g" /etc/xrdp/xrdp.ini
+            
+            # Genera certificati xrdp se non esistono
+            if [ ! -f /etc/xrdp/key.pem ]; then
+              cd /etc/xrdp
+              openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout key.pem -out cert.pem -days 365 \
+                -subj "/C=US/ST=State/L=City/O=Org/CN=localhost"
+              chown xrdp:xrdp key.pem cert.pem
+              chmod 400 key.pem
+            fi
+            
+            # Avvia xrdp manualmente
+            /usr/sbin/xrdp-sesman
+            /usr/sbin/xrdp
             
             # Salva le credenziali
-            echo "RDP_PASSWORD=$PASSWORD" >> /tmp/rdp_creds
+            echo "RDP_PASSWORD=$PASSWORD" > /tmp/rdp_creds
           '
           
           # Recupera la password e salvala in GITHUB_ENV
@@ -52,47 +70,41 @@ jobs:
       - name: Install Tailscale
         run: |
           docker exec fedora-rdp bash -c '
-            # Installa Tailscale per Fedora
-            dnf config-manager --add-repo https://pkgs.tailscale.com/stable/fedora/tailscale.repo
-            dnf install -y tailscale
+            # Scarica e installa Tailscale
+            curl -fsSL https://tailscale.com/install.sh | sh
             
-            # Avvia il servizio
-            systemctl enable --now tailscaled
+            # Avvia tailscaled in background
+            /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
+            sleep 3
           '
 
       - name: Establish Tailscale Connection
         run: |
           docker exec fedora-rdp bash -c "
             # Connetti a Tailscale
-            tailscale up --authkey=${{ secrets.AAA_AUTH_KEY }} --hostname=gh-fedora-$GITHUB_RUN_ID
+            /usr/bin/tailscale up --authkey=${{ secrets.AAA_AUTH_KEY }} --hostname=gh-fedora-$GITHUB_RUN_ID --accept-routes
             
             # Attendi assegnazione IP
-            for i in {1..10}; do
-              TSIP=\$(tailscale ip -4 2>/dev/null)
+            for i in {1..20}; do
+              TSIP=\$(/usr/bin/tailscale ip -4 2>/dev/null | head -n1)
               if [ -n \"\$TSIP\" ]; then
-                echo \"TAILSCALE_IP=\$TSIP\" >> /tmp/ts_ip
+                echo \"TAILSCALE_IP=\$TSIP\" > /tmp/ts_ip
+                echo \"Tailscale IP: \$TSIP\"
                 break
               fi
-              sleep 5
+              echo \"Waiting for Tailscale IP... attempt \$i\"
+              sleep 3
             done
           "
           
           # Recupera l'IP Tailscale
-          TSIP=$(docker exec fedora-rdp cat /tmp/ts_ip | grep TAILSCALE_IP | cut -d'=' -f2)
+          TSIP=$(docker exec fedora-rdp cat /tmp/ts_ip 2>/dev/null | grep TAILSCALE_IP | cut -d'=' -f2)
           if [ -z "$TSIP" ]; then
             echo "Failed to get Tailscale IP"
             exit 1
           fi
           echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
-
-      - name: Configure Firewall
-        run: |
-          docker exec fedora-rdp bash -c '
-            # Configura firewalld per permettere xrdp
-            systemctl start firewalld
-            firewall-cmd --permanent --add-port=3389/tcp
-            firewall-cmd --reload
-          '
+          echo "Tailscale connected: $TSIP"
 
       - name: Verify RDP Accessibility
         run: |
@@ -100,25 +112,70 @@ jobs:
           
           # Verifica che xrdp sia in ascolto
           docker exec fedora-rdp bash -c '
-            if ! ss -tlnp | grep :3389; then
+            if ! ss -tlnp 2>/dev/null | grep :3389; then
               echo "xrdp not listening on port 3389"
-              exit 1
+              # Prova a riavviare xrdp
+              pkill -9 xrdp
+              /usr/sbin/xrdp-sesman
+              /usr/sbin/xrdp
+              sleep 2
+              if ! ss -tlnp 2>/dev/null | grep :3389; then
+                echo "Failed to start xrdp"
+                exit 1
+              fi
             fi
-            echo "xrdp is running correctly"
+            echo "✓ xrdp is running correctly on port 3389"
+          '
+          
+          # Test connettività dalla macchina host
+          if ! nc -zv -w5 localhost 3389 2>&1 | grep -q succeeded; then
+            echo "Warning: Could not verify RDP port from host"
+          else
+            echo "✓ RDP port accessible from host"
+          fi
+
+      - name: Display Connection Info
+        run: |
+          docker exec fedora-rdp bash -c '
+            echo ""
+            echo "╔════════════════════════════════════════╗"
+            echo "║         RDP CONNECTION INFO            ║"
+            echo "╠════════════════════════════════════════╣"
+            echo "║ Tailscale IP: '$TAILSCALE_IP'         "
+            echo "║ Username:     rdpuser                  ║"
+            echo "║ Password:     (see below)              ║"
+            echo "║ Port:         3389                     ║"
+            echo "╚════════════════════════════════════════╝"
+            echo ""
+            echo "🔐 Password: '$RDP_CREDS'"
+            echo ""
+            echo "📝 To connect:"
+            echo "   remmina (Linux) or Microsoft Remote Desktop"
+            echo "   Address: '$TAILSCALE_IP':3389"
+            echo ""
           '
 
       - name: Maintain Connection
         run: |
-          echo ""
-          echo "=== RDP ACCESS ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: rdpuser"
-          echo "Password: $RDP_CREDS"
-          echo "=================="
+          echo "[$(date)] RDP Session Active"
+          echo "Press 'Cancel workflow' button to terminate"
           echo ""
           
-          # Mantieni il container attivo
+          # Mantieni il workflow attivo
           while true; do
-            echo "[$(date)] RDP Active - Use workflow cancellation to terminate"
+            # Verifica che xrdp sia ancora in esecuzione
+            if ! docker exec fedora-rdp pgrep xrdp > /dev/null; then
+              echo "[$(date)] xrdp stopped, restarting..."
+              docker exec fedora-rdp /usr/sbin/xrdp-sesman
+              docker exec fedora-rdp /usr/sbin/xrdp
+            fi
+            
+            # Verifica che tailscale sia connesso
+            STATUS=$(docker exec fedora-rdp /usr/bin/tailscale status --json 2>/dev/null | grep -o '"BackendState":"[^"]*"' | cut -d'"' -f4)
+            if [ "$STATUS" != "Running" ]; then
+              echo "[$(date)] Tailscale not running, status: $STATUS"
+            fi
+            
+            echo "[$(date)] ✓ Services running | IP: $TAILSCALE_IP"
             sleep 300
           done
