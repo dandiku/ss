@@ -1,0 +1,124 @@
+name: fedora-rdp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Setup Fedora Container
+        run: |
+          # Avvia un container Fedora con systemd
+          docker run -d --name fedora-rdp --privileged \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+            fedora:latest /usr/sbin/init
+          
+          # Installa pacchetti necessari
+          docker exec fedora-rdp bash -c "
+            dnf install -y xrdp tigervnc-server xorg-x11-server-Xorg \
+              xfce4-session xfce4-panel xfce4-terminal \
+              passwd sudo procps-ng iproute iptables wget
+          "
+
+      - name: Configure xrdp and Create User
+        run: |
+          docker exec fedora-rdp bash -c '
+            # Genera password casuale sicura
+            PASSWORD=$(openssl rand -base64 16 | tr -dc "A-Za-z0-9!@#$%^&*" | head -c 16)
+            
+            # Crea utente RDP
+            useradd -m -G wheel rdpuser
+            echo "rdpuser:$PASSWORD" | chpasswd
+            
+            # Configura XFCE come desktop environment
+            echo "startxfce4" > /home/rdpuser/.Xclients
+            chmod +x /home/rdpuser/.Xclients
+            
+            # Configura xrdp
+            systemctl enable xrdp
+            systemctl start xrdp
+            
+            # Salva le credenziali
+            echo "RDP_PASSWORD=$PASSWORD" >> /tmp/rdp_creds
+          '
+          
+          # Recupera la password e salvala in GITHUB_ENV
+          PASSWORD=$(docker exec fedora-rdp cat /tmp/rdp_creds | grep RDP_PASSWORD | cut -d'=' -f2)
+          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          docker exec fedora-rdp bash -c '
+            # Installa Tailscale per Fedora
+            dnf config-manager --add-repo https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+            dnf install -y tailscale
+            
+            # Avvia il servizio
+            systemctl enable --now tailscaled
+          '
+
+      - name: Establish Tailscale Connection
+        run: |
+          docker exec fedora-rdp bash -c "
+            # Connetti a Tailscale
+            tailscale up --authkey=${{ secrets.AAA_AUTH_KEY }} --hostname=gh-fedora-$GITHUB_RUN_ID
+            
+            # Attendi assegnazione IP
+            for i in {1..10}; do
+              TSIP=\$(tailscale ip -4 2>/dev/null)
+              if [ -n \"\$TSIP\" ]; then
+                echo \"TAILSCALE_IP=\$TSIP\" >> /tmp/ts_ip
+                break
+              fi
+              sleep 5
+            done
+          "
+          
+          # Recupera l'IP Tailscale
+          TSIP=$(docker exec fedora-rdp cat /tmp/ts_ip | grep TAILSCALE_IP | cut -d'=' -f2)
+          if [ -z "$TSIP" ]; then
+            echo "Failed to get Tailscale IP"
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
+
+      - name: Configure Firewall
+        run: |
+          docker exec fedora-rdp bash -c '
+            # Configura firewalld per permettere xrdp
+            systemctl start firewalld
+            firewall-cmd --permanent --add-port=3389/tcp
+            firewall-cmd --reload
+          '
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          # Verifica che xrdp sia in ascolto
+          docker exec fedora-rdp bash -c '
+            if ! ss -tlnp | grep :3389; then
+              echo "xrdp not listening on port 3389"
+              exit 1
+            fi
+            echo "xrdp is running correctly"
+          '
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdpuser"
+          echo "Password: $RDP_CREDS"
+          echo "=================="
+          echo ""
+          
+          # Mantieni il container attivo
+          while true; do
+            echo "[$(date)] RDP Active - Use workflow cancellation to terminate"
+            sleep 300
+          done
